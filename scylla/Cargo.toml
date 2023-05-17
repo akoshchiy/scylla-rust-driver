@@ -58,6 +58,7 @@ serde_yaml = { version = "0.9.14", optional = true }
 url = { version = "2.3.1", optional = true }
 base64 = { version = "0.13.1", optional = true }
 rand_pcg = "0.3.1"
+async-once-cell = "0.5.2"
 
 [dev-dependencies]
 scylla-proxy = { version = "0.0.2", path = "../scylla-proxy"}

@@ -1,4 +1,5 @@
 use crate::frame::response::event::Event;
+use crate::prepared_statement::{CachedPreparedStatement, PreparedStatement};
 use crate::routing::Token;
 use crate::statement::query::Query;
 use crate::transport::connection::{Connection, ConnectionConfig};
@@ -46,6 +47,7 @@ pub(crate) struct MetadataReader {
     keyspaces_to_fetch: Vec<String>,
     fetch_schema: bool,
     host_filter: Option<Arc<dyn HostFilter>>,
+    queries: MetadataQueries,
 }
 
 /// Describes all metadata retrieved from the cluster
@@ -344,6 +346,134 @@ impl From<InvalidCqlType> for QueryError {
     }
 }
 
+struct MetadataQueries {
+    peers: CachedPreparedStatement,
+    local: CachedPreparedStatement,
+    partitioner: CachedPreparedStatement,
+    keyspaces: CachedPreparedStatement,
+    keyspacces_filter: CachedPreparedStatement,
+    user_types: CachedPreparedStatement,
+    user_types_filter: CachedPreparedStatement,
+    tables: CachedPreparedStatement,
+    tables_filter: CachedPreparedStatement,
+    views: CachedPreparedStatement,
+    views_filter: CachedPreparedStatement,
+    schema: CachedPreparedStatement,
+    schema_filter: CachedPreparedStatement,
+}
+
+impl MetadataQueries {
+    fn new() -> Self {
+        Self {
+            peers: MetadataQueries::new_cached_prepared("select host_id, rpc_address, data_center, rack, tokens from system.peers"),
+            local: MetadataQueries::new_cached_prepared("select host_id, rpc_address, data_center, rack, tokens from system.local"),
+            partitioner: MetadataQueries::new_cached_prepared("select keyspace_name, table_name, partitioner from system_schema.scylla_tables"),
+            keyspaces: MetadataQueries::new_cached_prepared("select keyspace_name, replication from system_schema.keyspaces"),
+            keyspacces_filter: MetadataQueries::new_cached_prepared("select keyspace_name, replication from system_schema.keyspaces where keyspace_name in ?"),
+            user_types: MetadataQueries::new_cached_prepared("select keyspace_name, type_name, field_names, field_types from system_schema.types"),
+            user_types_filter: MetadataQueries::new_cached_prepared("select keyspace_name, type_name, field_names, field_types from system_schema.types where keyspace_name in ?"),
+            tables: MetadataQueries::new_cached_prepared("SELECT keyspace_name, table_name FROM system_schema.tables"),
+            tables_filter: MetadataQueries::new_cached_prepared("SELECT keyspace_name, table_name FROM system_schema.tables where keyspace_name in ?"),
+            views: MetadataQueries::new_cached_prepared("SELECT keyspace_name, view_name, base_table_name FROM system_schema.views"),
+            views_filter: MetadataQueries::new_cached_prepared("SELECT keyspace_name, view_name, base_table_name FROM system_schema.views where keyspace_name in ?"),
+            schema: MetadataQueries::new_cached_prepared("select keyspace_name, table_name, column_name, kind, position, type from system_schema.columns"),
+            schema_filter: MetadataQueries::new_cached_prepared("select keyspace_name, table_name, column_name, kind, position, type from system_schema.columns where keyspace_name in ?"),
+        }
+    }
+
+    async fn peers(&self, conn: &Arc<Connection>) -> Result<PreparedStatement, QueryError> {
+        MetadataQueries::prepare(&self.peers, conn).await
+    }
+
+    async fn local(&self, conn: &Arc<Connection>) -> Result<PreparedStatement, QueryError> {
+        MetadataQueries::prepare(&self.local, conn).await
+    }
+
+    async fn partitioner(&self, conn: &Arc<Connection>) -> Result<PreparedStatement, QueryError> {
+        MetadataQueries::prepare(&self.partitioner, conn).await
+    }
+
+    async fn user_types(
+        &self,
+        conn: &Arc<Connection>,
+        with_filter: bool,
+    ) -> Result<PreparedStatement, QueryError> {
+        let query = if with_filter {
+            &self.user_types_filter
+        } else {
+            &self.user_types
+        };
+        MetadataQueries::prepare(query, conn).await
+    }
+
+    async fn keyspaces(
+        &self,
+        conn: &Arc<Connection>,
+        with_filter: bool,
+    ) -> Result<PreparedStatement, QueryError> {
+        let query = if with_filter {
+            &self.keyspacces_filter
+        } else {
+            &self.keyspaces
+        };
+        MetadataQueries::prepare(query, conn).await
+    }
+
+    async fn tables(
+        &self,
+        conn: &Arc<Connection>,
+        with_filter: bool,
+    ) -> Result<PreparedStatement, QueryError> {
+        let query = if with_filter {
+            &self.tables_filter
+        } else {
+            &self.tables
+        };
+        MetadataQueries::prepare(query, conn).await
+    }
+
+    async fn views(
+        &self,
+        conn: &Arc<Connection>,
+        with_filter: bool,
+    ) -> Result<PreparedStatement, QueryError> {
+        let query = if with_filter {
+            &self.views_filter
+        } else {
+            &self.views
+        };
+        MetadataQueries::prepare(query, conn).await
+    }
+
+    async fn schema(
+        &self,
+        conn: &Arc<Connection>,
+        with_filter: bool,
+    ) -> Result<PreparedStatement, QueryError> {
+        let query = if with_filter {
+            &self.schema_filter
+        } else {
+            &self.schema
+        };
+        MetadataQueries::prepare(query, conn).await
+    }
+
+    async fn prepare(
+        statement: &CachedPreparedStatement,
+        conn: &Arc<Connection>,
+    ) -> Result<PreparedStatement, QueryError> {
+        statement
+            .get_or_init(|query| async move { conn.prepare(query).await })
+            .await
+    }
+
+    fn new_cached_prepared(query: &str) -> CachedPreparedStatement {
+        let mut query = Query::new(query);
+        query.set_page_size(1024);
+        CachedPreparedStatement::new(query)
+    }
+}
+
 impl Metadata {
     /// Creates new, dummy metadata from a given list of peers.
     ///
@@ -419,6 +549,7 @@ impl MetadataReader {
             keyspaces_to_fetch,
             fetch_schema,
             host_filter: host_filter.clone(),
+            queries: MetadataQueries::new(),
         }
     }
 
@@ -504,6 +635,7 @@ impl MetadataReader {
 
         let res = query_metadata(
             conn,
+            &self.queries,
             self.control_connection_endpoint.address().port(),
             &self.keyspaces_to_fetch,
             self.fetch_schema,
@@ -614,12 +746,13 @@ impl MetadataReader {
 
 async fn query_metadata(
     conn: &Arc<Connection>,
+    queries: &MetadataQueries,
     connect_port: u16,
     keyspace_to_fetch: &[String],
     fetch_schema: bool,
 ) -> Result<Metadata, QueryError> {
-    let peers_query = query_peers(conn, connect_port);
-    let keyspaces_query = query_keyspaces(conn, keyspace_to_fetch, fetch_schema);
+    let peers_query = query_peers(queries, conn, connect_port);
+    let keyspaces_query = query_keyspaces(queries, conn, keyspace_to_fetch, fetch_schema);
 
     let (peers, keyspaces) = tokio::try_join!(peers_query, keyspaces_query)?;
 
@@ -665,23 +798,25 @@ impl NodeInfoSource {
     }
 }
 
-async fn query_peers(conn: &Arc<Connection>, connect_port: u16) -> Result<Vec<Peer>, QueryError> {
-    let mut peers_query =
-        Query::new("select host_id, rpc_address, data_center, rack, tokens from system.peers");
-    peers_query.set_page_size(1024);
+async fn query_peers(
+    queries: &MetadataQueries,
+    conn: &Arc<Connection>,
+    connect_port: u16,
+) -> Result<Vec<Peer>, QueryError> {
+    let peers_query = queries.peers(conn).await?;
+
     let peers_query_stream = conn
         .clone()
-        .query_iter(peers_query, &[])
+        .execute_iter(peers_query, &[])
         .into_stream()
         .try_flatten()
         .and_then(|row_result| future::ok((NodeInfoSource::Peer, row_result)));
 
-    let mut local_query =
-        Query::new("select host_id, rpc_address, data_center, rack, tokens from system.local");
-    local_query.set_page_size(1024);
+    let local_query = queries.local(conn).await?;
+
     let local_query_stream = conn
         .clone()
-        .query_iter(local_query, &[])
+        .execute_iter(local_query, &[])
         .into_stream()
         .try_flatten()
         .and_then(|row_result| future::ok((NodeInfoSource::Local, row_result)));
@@ -776,42 +911,40 @@ async fn create_peer_from_row(
 
 fn query_filter_keyspace_name(
     conn: &Arc<Connection>,
-    query_str: &str,
+    prepared: PreparedStatement,
     keyspaces_to_fetch: &[String],
 ) -> impl Stream<Item = Result<Row, QueryError>> {
     let keyspaces = &[keyspaces_to_fetch] as &[&[String]];
-    let (query_str, query_values) = if !keyspaces_to_fetch.is_empty() {
-        (format!("{query_str} where keyspace_name in ?"), keyspaces)
+    let query_values = if !keyspaces_to_fetch.is_empty() {
+        keyspaces
     } else {
-        (query_str.into(), &[] as &[&[String]])
+        &[] as &[&[String]]
     };
     let query_values = query_values.serialized().map(|sv| sv.into_owned());
-    let mut query = Query::new(query_str);
     let conn = conn.clone();
-    query.set_page_size(1024);
     let fut = async move {
         let query_values = query_values?;
-        conn.query_iter(query, query_values).await
+        conn.execute_iter(prepared, query_values).await
     };
     fut.into_stream().try_flatten()
 }
 
 async fn query_keyspaces(
+    queries: &MetadataQueries,
     conn: &Arc<Connection>,
     keyspaces_to_fetch: &[String],
     fetch_schema: bool,
 ) -> Result<HashMap<String, Keyspace>, QueryError> {
-    let rows = query_filter_keyspace_name(
-        conn,
-        "select keyspace_name, replication from system_schema.keyspaces",
-        keyspaces_to_fetch,
-    );
+    let keyspace_query = queries
+        .keyspaces(conn, !keyspaces_to_fetch.is_empty())
+        .await?;
+    let rows = query_filter_keyspace_name(conn, keyspace_query, keyspaces_to_fetch);
 
     let (mut all_tables, mut all_views, mut all_user_defined_types) = if fetch_schema {
-        let udts = query_user_defined_types(conn, keyspaces_to_fetch).await?;
+        let udts = query_user_defined_types(queries, conn, keyspaces_to_fetch).await?;
         (
-            query_tables(conn, keyspaces_to_fetch, &udts).await?,
-            query_views(conn, keyspaces_to_fetch, &udts).await?,
+            query_tables(queries, conn, keyspaces_to_fetch, &udts).await?,
+            query_views(queries, conn, keyspaces_to_fetch, &udts).await?,
             udts,
         )
     } else {
@@ -884,14 +1017,14 @@ impl TryFrom<UdtRow> for UdtRowWithParsedFieldTypes {
 }
 
 async fn query_user_defined_types(
+    queries: &MetadataQueries,
     conn: &Arc<Connection>,
     keyspaces_to_fetch: &[String],
 ) -> Result<HashMap<String, HashMap<String, Arc<UserDefinedType>>>, QueryError> {
-    let rows = query_filter_keyspace_name(
-        conn,
-        "select keyspace_name, type_name, field_names, field_types from system_schema.types",
-        keyspaces_to_fetch,
-    );
+    let prepared = queries
+        .user_types(conn, !keyspaces_to_fetch.is_empty())
+        .await?;
+    let rows = query_filter_keyspace_name(conn, prepared, keyspaces_to_fetch);
 
     let mut udt_rows: Vec<UdtRowWithParsedFieldTypes> = rows
         .map(|row_result| {
@@ -1204,17 +1337,15 @@ mod toposort_tests {
 }
 
 async fn query_tables(
+    queries: &MetadataQueries,
     conn: &Arc<Connection>,
     keyspaces_to_fetch: &[String],
     udts: &HashMap<String, HashMap<String, Arc<UserDefinedType>>>,
 ) -> Result<HashMap<String, HashMap<String, Table>>, QueryError> {
-    let rows = query_filter_keyspace_name(
-        conn,
-        "SELECT keyspace_name, table_name FROM system_schema.tables",
-        keyspaces_to_fetch,
-    );
+    let tables_query = queries.tables(conn, !keyspaces_to_fetch.is_empty()).await?;
+    let rows = query_filter_keyspace_name(conn, tables_query, keyspaces_to_fetch);
     let mut result = HashMap::new();
-    let mut tables = query_tables_schema(conn, keyspaces_to_fetch, udts).await?;
+    let mut tables = query_tables_schema(queries, conn, keyspaces_to_fetch, udts).await?;
 
     rows.map(|row_result| {
         let row = row_result?;
@@ -1245,18 +1376,16 @@ async fn query_tables(
 }
 
 async fn query_views(
+    queries: &MetadataQueries,
     conn: &Arc<Connection>,
     keyspaces_to_fetch: &[String],
     udts: &HashMap<String, HashMap<String, Arc<UserDefinedType>>>,
 ) -> Result<HashMap<String, HashMap<String, MaterializedView>>, QueryError> {
-    let rows = query_filter_keyspace_name(
-        conn,
-        "SELECT keyspace_name, view_name, base_table_name FROM system_schema.views",
-        keyspaces_to_fetch,
-    );
+    let views_query = queries.views(conn, !keyspaces_to_fetch.is_empty()).await?;
+    let rows = query_filter_keyspace_name(conn, views_query, keyspaces_to_fetch);
 
     let mut result = HashMap::new();
-    let mut tables = query_tables_schema(conn, keyspaces_to_fetch, udts).await?;
+    let mut tables = query_tables_schema(queries, conn, keyspaces_to_fetch, udts).await?;
 
     rows.map(|row_result| {
         let row = row_result?;
@@ -1291,6 +1420,7 @@ async fn query_views(
 }
 
 async fn query_tables_schema(
+    queries: &MetadataQueries,
     conn: &Arc<Connection>,
     keyspaces_to_fetch: &[String],
     udts: &HashMap<String, HashMap<String, Arc<UserDefinedType>>>,
@@ -1300,9 +1430,8 @@ async fn query_tables_schema(
     // This column shouldn't be exposed to the user but is currently exposed in system tables.
     const THRIFT_EMPTY_TYPE: &str = "empty";
 
-    let rows = query_filter_keyspace_name(conn,
-        "select keyspace_name, table_name, column_name, kind, position, type from system_schema.columns", keyspaces_to_fetch
-    );
+    let schema_query = queries.schema(conn, !keyspaces_to_fetch.is_empty()).await?;
+    let rows = query_filter_keyspace_name(conn, schema_query, keyspaces_to_fetch);
 
     let mut tables_schema = HashMap::new();
 
@@ -1358,7 +1487,7 @@ async fn query_tables_schema(
     .try_for_each(|_| future::ok(()))
     .await?;
 
-    let mut all_partitioners = query_table_partitioners(conn).await?;
+    let mut all_partitioners = query_table_partitioners(queries, conn).await?;
     let mut result = HashMap::new();
 
     for ((keyspace_name, table_name), (columns, partition_key_columns, clustering_key_columns)) in
@@ -1512,16 +1641,14 @@ fn freeze_type(type_: PreCqlType) -> PreCqlType {
 }
 
 async fn query_table_partitioners(
+    queries: &MetadataQueries,
     conn: &Arc<Connection>,
 ) -> Result<HashMap<(String, String), Option<String>>, QueryError> {
-    let mut partitioner_query = Query::new(
-        "select keyspace_name, table_name, partitioner from system_schema.scylla_tables",
-    );
-    partitioner_query.set_page_size(1024);
+    let partitioner_query = queries.partitioner(conn).await?;
 
     let rows = conn
         .clone()
-        .query_iter(partitioner_query, &[])
+        .execute_iter(partitioner_query, &[])
         .into_stream()
         .try_flatten();
 

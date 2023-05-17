@@ -1,4 +1,7 @@
+use async_once_cell::OnceCell;
 use bytes::{BufMut, Bytes, BytesMut};
+use futures::Future;
+use scylla_cql::errors::QueryError;
 use smallvec::{smallvec, SmallVec};
 use std::convert::TryInto;
 use std::sync::Arc;
@@ -11,6 +14,7 @@ use crate::frame::response::result::PreparedMetadata;
 use crate::frame::types::{Consistency, SerialConsistency};
 use crate::frame::value::SerializedValues;
 use crate::history::HistoryListener;
+use crate::query::Query;
 use crate::retry_policy::RetryPolicy;
 use crate::transport::execution_profile::ExecutionProfileHandle;
 use crate::transport::partitioner::PartitionerName;
@@ -336,4 +340,30 @@ pub enum PartitionKeyError {
     NoPkIndexValue(u16, i16),
     #[error("Value bytes too long to create partition key, max 65 535 allowed! value.len(): {0}")]
     ValueTooLong(usize),
+}
+
+pub(crate) struct CachedPreparedStatement {
+    query: Query,
+    value: OnceCell<PreparedStatement>,
+}
+
+impl CachedPreparedStatement {
+    pub(crate) fn new(query: Query) -> Self {
+        Self {
+            query,
+            value: OnceCell::new(),
+        }
+    }
+
+    pub(crate) async fn get_or_init<'a, P, Fut>(
+        &'a self,
+        provider: P,
+    ) -> Result<PreparedStatement, QueryError>
+    where
+        P: FnOnce(&'a Query) -> Fut,
+        Fut: Future<Output = Result<PreparedStatement, QueryError>>,
+    {
+        let statement = self.value.get_or_try_init(provider(&self.query)).await?;
+        Ok(statement.clone())
+    }
 }

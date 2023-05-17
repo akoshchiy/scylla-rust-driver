@@ -590,6 +590,7 @@ impl Connection {
 
     /// Executes a query and fetches its results over multiple pages, using
     /// the asynchronous iterator interface.
+    #[allow(dead_code)]
     pub(crate) async fn query_iter(
         self: Arc<Self>,
         query: Query,
@@ -604,6 +605,32 @@ impl Connection {
 
         RowIterator::new_for_connection_query_iter(
             query,
+            self,
+            serialized_values,
+            consistency,
+            serial_consistency,
+        )
+        .await
+    }
+
+    /// Executes a prepared statement and fetches its results over multiple pages, using
+    /// the asynchronous iterator interface.
+    pub(crate) async fn execute_iter(
+        self: Arc<Self>,
+        prepared: impl Into<PreparedStatement>,
+        values: impl ValueList,
+    ) -> Result<RowIterator, QueryError> {
+        let prepared: PreparedStatement = prepared.into();
+        let serialized_values = values.serialized()?.into_owned();
+
+        let consistency = prepared
+            .get_consistency()
+            .unwrap_or(self.config.default_consistency);
+
+        let serial_consistency = prepared.get_serial_consistency();
+
+        RowIterator::new_for_connection_prepared_statement(
+            prepared,
             self,
             serialized_values,
             consistency,
@@ -1632,6 +1659,7 @@ mod tests {
     #[cfg(not(scylla_cloud_tests))]
     async fn connection_query_iter_test() {
         let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
+
         let addr: SocketAddr = resolve_hostname(&uri).await;
 
         let (connection, _) = super::open_connection(
@@ -1713,6 +1741,105 @@ mod tests {
         // 3. INSERT query_iter should work and not return any rows.
         let insert_res1 = connection
             .query_iter(insert_query, (0,))
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(insert_res1.is_empty());
+    }
+
+    /// Same as connection_query_iter_test, but with execute_iter instead.
+    #[tokio::test]
+    #[cfg(not(scylla_cloud_tests))]
+    async fn connection_execute_iter_test() {
+        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
+
+        let addr: SocketAddr = resolve_hostname(&uri).await;
+
+        let (connection, _) = super::open_connection(
+            UntranslatedEndpoint::ContactPoint(ContactPoint {
+                address: addr,
+                datacenter: None,
+            }),
+            None,
+            ConnectionConfig::default(),
+        )
+        .await
+        .unwrap();
+        let connection = Arc::new(connection);
+
+        let ks = unique_keyspace_name();
+
+        {
+            // Preparation phase
+            let session = SessionBuilder::new()
+                .known_node_addr(addr)
+                .build()
+                .await
+                .unwrap();
+            session.query(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'SimpleStrategy', 'replication_factor' : 1}}", ks.clone()), &[]).await.unwrap();
+            session.use_keyspace(ks.clone(), false).await.unwrap();
+            session
+                .query("DROP TABLE IF EXISTS connection_query_iter_tab", &[])
+                .await
+                .unwrap();
+            session
+                .query(
+                    "CREATE TABLE IF NOT EXISTS connection_query_iter_tab (p int primary key)",
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+
+        connection
+            .use_keyspace(&super::VerifiedKeyspaceName::new(ks, false).unwrap())
+            .await
+            .unwrap();
+
+        // 1. SELECT from an empty table returns query result where rows are Some(Vec::new())
+        let select_query = Query::new("SELECT p FROM connection_query_iter_tab").with_page_size(7);
+        let select_statement = connection.prepare(&select_query).await.unwrap();
+
+        let empty_res = connection
+            .clone()
+            .execute_iter(select_statement.clone(), &[])
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(empty_res.is_empty());
+
+        // 2. Insert 100 and select using query_iter with page_size 7
+        let values: Vec<i32> = (0..100).collect();
+        let mut insert_futures = Vec::new();
+        let insert_query =
+            Query::new("INSERT INTO connection_query_iter_tab (p) VALUES (?)").with_page_size(7);
+        let insert_statement = connection.prepare(&insert_query).await.unwrap();
+
+        for v in &values {
+            insert_futures.push(connection.query_single_page(insert_query.clone(), (v,)));
+        }
+
+        futures::future::try_join_all(insert_futures).await.unwrap();
+
+        let mut results: Vec<i32> = connection
+            .clone()
+            .execute_iter(select_statement.clone(), &[])
+            .await
+            .unwrap()
+            .into_typed::<(i32,)>()
+            .map(|ret| ret.unwrap().0)
+            .collect::<Vec<_>>()
+            .await;
+        results.sort_unstable(); // Clippy recommended to use sort_unstable instead of sort()
+        assert_eq!(results, values);
+
+        // 3. INSERT query_iter should work and not return any rows.
+        let insert_res1 = connection
+            .execute_iter(insert_statement.clone(), (0,))
             .await
             .unwrap()
             .try_collect::<Vec<_>>()

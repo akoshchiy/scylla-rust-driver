@@ -7,6 +7,7 @@ use crate::cloud::CloudConfig;
 use crate::frame::types::LegacyConsistency;
 use crate::history;
 use crate::history::HistoryListener;
+use crate::prepared_statement::CachedPreparedStatement;
 use crate::retry_policy::RetryPolicy;
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
@@ -125,6 +126,7 @@ pub struct Session {
     auto_await_schema_agreement_timeout: Option<Duration>,
     refresh_metadata_on_auto_schema_agreement: bool,
     keyspace_name: ArcSwapOption<String>,
+    inner_queries: InnerQueries,
 }
 
 /// This implementation deliberately omits some details from Cluster in order
@@ -377,6 +379,47 @@ pub enum RunQueryResult<ResT> {
     Completed(ResT),
 }
 
+struct InnerQueries {
+    traces_sessions: CachedPreparedStatement,
+    traces_events: CachedPreparedStatement,
+}
+
+impl InnerQueries {
+    fn new() -> Self {
+        Self {
+            traces_sessions: InnerQueries::new_cached_prepared(
+                crate::tracing::TRACES_SESSION_QUERY_STR,
+            ),
+            traces_events: InnerQueries::new_cached_prepared(
+                crate::tracing::TRACES_EVENTS_QUERY_STR,
+            ),
+        }
+    }
+
+    async fn traces_sessions(&self, session: &Session) -> Result<PreparedStatement, QueryError> {
+        InnerQueries::prepare(&self.traces_sessions, session).await
+    }
+
+    async fn traces_events(&self, session: &Session) -> Result<PreparedStatement, QueryError> {
+        InnerQueries::prepare(&self.traces_events, session).await
+    }
+
+    async fn prepare(
+        statement: &CachedPreparedStatement,
+        sesssion: &Session,
+    ) -> Result<PreparedStatement, QueryError> {
+        statement
+            .get_or_init(|query| async move { sesssion.prepare(query.clone()).await })
+            .await
+    }
+
+    fn new_cached_prepared(query: &str) -> CachedPreparedStatement {
+        let mut query = Query::new(query);
+        query.set_page_size(1024);
+        CachedPreparedStatement::new(query)
+    }
+}
+
 /// Represents a CQL session, which can be used to communicate
 /// with the database
 impl Session {
@@ -500,6 +543,7 @@ impl Session {
             refresh_metadata_on_auto_schema_agreement: config
                 .refresh_metadata_on_auto_schema_agreement,
             keyspace_name: ArcSwapOption::default(), // will be set by use_keyspace
+            inner_queries: InnerQueries::new(),
         };
 
         if let Some(keyspace_name) = config.used_keyspace {
@@ -1350,18 +1394,16 @@ impl Session {
         consistency: Option<Consistency>,
     ) -> Result<Option<TracingInfo>, QueryError> {
         // Query system_traces.sessions for TracingInfo
-        let mut traces_session_query = Query::new(crate::tracing::TRACES_SESSION_QUERY_STR);
+        let mut traces_session_query = self.inner_queries.traces_sessions(self).await?;
         traces_session_query.config.consistency = consistency;
-        traces_session_query.set_page_size(1024);
 
         // Query system_traces.events for TracingEvents
-        let mut traces_events_query = Query::new(crate::tracing::TRACES_EVENTS_QUERY_STR);
+        let mut traces_events_query = self.inner_queries.traces_events(self).await?;
         traces_events_query.config.consistency = consistency;
-        traces_events_query.set_page_size(1024);
 
         let (traces_session_res, traces_events_res) = tokio::try_join!(
-            self.query(traces_session_query, (tracing_id,)),
-            self.query(traces_events_query, (tracing_id,))
+            self.execute(&traces_session_query, (tracing_id,)),
+            self.execute(&traces_events_query, (tracing_id,))
         )?;
 
         // Get tracing info

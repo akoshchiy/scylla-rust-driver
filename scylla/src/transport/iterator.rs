@@ -353,6 +353,37 @@ impl RowIterator {
         Self::new_from_worker_future(worker_task, receiver).await
     }
 
+    pub(crate) async fn new_for_connection_prepared_statement(
+        mut statement: PreparedStatement,
+        connection: Arc<Connection>,
+        values: SerializedValues,
+        consistency: Consistency,
+        serial_consistency: Option<SerialConsistency>,
+    ) -> Result<RowIterator, QueryError> {
+        if statement.get_page_size().is_none() {
+            statement.set_page_size(DEFAULT_ITER_PAGE_SIZE);
+        }
+        let (sender, receiver) = mpsc::channel::<Result<ReceivedPage, QueryError>>(1);
+
+        let worker_task = async move {
+            let worker = SingleConnectionRowIteratorWorker {
+                sender: sender.into(),
+                fetcher: |paging_state| {
+                    connection.execute_with_consistency(
+                        &statement,
+                        &values,
+                        consistency,
+                        serial_consistency,
+                        paging_state,
+                    )
+                },
+            };
+            worker.work().await
+        };
+
+        Self::new_from_worker_future(worker_task, receiver).await
+    }
+
     async fn new_from_worker_future(
         worker_task: impl Future<Output = PageSendAttemptedProof> + Send + 'static,
         mut receiver: mpsc::Receiver<Result<ReceivedPage, QueryError>>,
